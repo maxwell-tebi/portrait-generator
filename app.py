@@ -21,50 +21,72 @@ GDRIVE_FILE_ID = "1fgZrjMgZBZP-9TqUPGmnR_FpHcANZ3DB"
 
 # ---- Robust Google Drive downloader ----
 def download_from_gdrive(file_id, destination):
-    """
-    Handles Google Drive's virus scan warning for large files
-    by manually following the confirmation token.
-    """
-    session = requests.Session()
-    URL = "https://drive.google.com/uc?export=download"
+    session  = requests.Session()
 
-    # First request — get confirmation token
-    response = session.get(URL, params={"id": file_id}, stream=True)
+    # Step 1 — initial request
+    response = session.get(
+        "https://drive.google.com/uc",
+        params={"export": "download", "id": file_id},
+        stream=True
+    )
+
+    # Step 2 — find confirmation token (for large files)
     token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             token = value
             break
 
-    # Second request — use token to confirm large file download
-    if token:
-        response = session.get(
-            URL,
-            params={"id": file_id, "confirm": token},
-            stream=True
-        )
+    # Also check response content for newer Google Drive confirmation
+    if token is None:
+        for chunk in response.iter_content(chunk_size=32768):
+            # Look for confirmation token in HTML response
+            chunk_str = chunk.decode("utf-8", errors="ignore")
+            if "confirm=" in chunk_str:
+                import re
+                match = re.search(r'confirm=([0-9A-Za-z_\-]+)', chunk_str)
+                if match:
+                    token = match.group(1)
+                    break
 
-    # Write file in chunks
-    CHUNK_SIZE = 32768
+    # Step 3 — download with confirmation token
+    response = session.get(
+        "https://drive.google.com/uc",
+        params={"export": "download", "id": file_id, "confirm": token if token else "t"},
+        stream=True
+    )
+
+    # Step 4 — write to disk in chunks
     with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
+        for chunk in response.iter_content(chunk_size=32768):
             if chunk:
                 f.write(chunk)
+
+    return os.path.getsize(destination)
 
 # ---- Download model if not present ----
 def download_model():
     if not os.path.exists(MODEL_FILE):
         with st.spinner("Downloading model weights... (first time only, ~170MB)"):
             try:
-                download_from_gdrive(GDRIVE_FILE_ID, MODEL_FILE)
-                # Verify file was actually downloaded and has content
-                if os.path.getsize(MODEL_FILE) < 1000:
+                size = download_from_gdrive(GDRIVE_FILE_ID, MODEL_FILE)
+
+                # Verify — a valid .pth file must be > 100MB
+                if size < 100 * 1024 * 1024:
                     os.remove(MODEL_FILE)
-                    st.error("Download failed — file too small. Check Google Drive sharing settings.")
+                    st.error(
+                        f"Download failed — got {size/1024:.1f} KB instead of ~170MB. "
+                        "Google Drive may have served a warning page. "
+                        "Please check that the file sharing is set to 'Anyone with the link'."
+                    )
                     st.stop()
-                st.success("Model downloaded successfully!")
+
+                st.success(f"Model downloaded! ({size / 1024 / 1024:.1f} MB)")
+
             except Exception as e:
-                st.error(f"Download failed: {e}")
+                if os.path.exists(MODEL_FILE):
+                    os.remove(MODEL_FILE)
+                st.error(f"Download error: {e}")
                 st.stop()
 
 # ---- Load model ----
