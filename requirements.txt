@@ -6,3 +6,4 @@ Pillow
 numpy
 scikit-image
 requests
+huggingface_hub

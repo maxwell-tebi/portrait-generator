@@ -1,11 +1,11 @@
 import os
-import requests
 import streamlit as st
 import torch
 import numpy as np
 import cv2
 from PIL import Image, ImageEnhance, ImageFilter
 from skimage import transform as skimage_transform
+from huggingface_hub import hf_hub_download
 from u2net_model import U2NET
 
 # ---- Page config ----
@@ -16,52 +16,22 @@ st.set_page_config(
 )
 
 # ---- Hugging Face model config ----
-MODEL_FILE = "u2net_portrait.pth"
-HF_URL     = "https://huggingface.co/Maxwelltebi/u2net-portrait/resolve/main/u2net_portrait.pth"
-
-# ---- Download model from Hugging Face ----
-def download_model():
-    if not os.path.exists(MODEL_FILE):
-        with st.spinner("Downloading model weights... (first time only, ~170MB)"):
-            try:
-                response = requests.get(HF_URL, stream=True)
-                response.raise_for_status()
-
-                total    = int(response.headers.get('content-length', 0))
-                progress = st.progress(0)
-                received = 0
-
-                with open(MODEL_FILE, "wb") as f:
-                    for chunk in response.iter_content(chunk_size=32768):
-                        if chunk:
-                            f.write(chunk)
-                            received += len(chunk)
-                            if total:
-                                progress.progress(min(received / total, 1.0))
-
-                progress.empty()
-
-                # Verify file size
-                size = os.path.getsize(MODEL_FILE)
-                if size < 100 * 1024 * 1024:
-                    os.remove(MODEL_FILE)
-                    st.error(f"Download incomplete — only got {size/1024/1024:.1f}MB. Please refresh.")
-                    st.stop()
-
-                st.success(f"Model ready! ({size/1024/1024:.1f} MB)")
-
-            except Exception as e:
-                if os.path.exists(MODEL_FILE):
-                    os.remove(MODEL_FILE)
-                st.error(f"Download failed: {e}")
-                st.stop()
+HF_REPO_ID  = "Maxwelltebi/u2net-portrait"
+HF_FILENAME = "u2net_portrait.pth"
 
 # ---- Load model ----
 @st.cache_resource
 def load_model():
-    download_model()
+    with st.spinner("Loading model... (first time only, ~170MB)"):
+        # hf_hub_download handles everything — resuming, caching, verification
+        model_path = hf_hub_download(
+            repo_id=HF_REPO_ID,
+            filename=HF_FILENAME,
+            repo_type="model"
+        )
     net = U2NET(3, 1)
-    net.load_state_dict(torch.load(MODEL_FILE, map_location='cpu'))
+    state_dict = torch.load(model_path, map_location='cpu', weights_only=False)
+    net.load_state_dict(state_dict)
     net.eval()
     return net
 
