@@ -59,81 +59,49 @@ def ai_draw(orig_np, d):
     portrait = Image.fromarray((mask * 255)).convert('RGB')
     return portrait
 
-# ---- Style B: Detailed Pencil Sketch with Shading ----
+# ---- Style B: Pencil Sketch ----
 def pencil_sketch(orig_np, d):
 
-    # ---- Step 1: Smooth the image first to kill noise ----
-    # Bilateral filter preserves edges while removing noise/dots
-    smoothed = orig_np.copy()
-    for _ in range(4):
-        smoothed = cv2.bilateralFilter(smoothed, d=9, sigmaColor=50, sigmaSpace=50)
+    # ---- Step 1: Light smoothing — remove noise but keep face details ----
+    smoothed      = cv2.bilateralFilter(orig_np, d=7, sigmaColor=30, sigmaSpace=30)
 
-    # ---- Step 2: Convert to grayscale ----
-    gray = cv2.cvtColor(smoothed, cv2.COLOR_RGB2GRAY)
+    # ---- Step 2: Grayscale of smoothed image for shading ----
+    gray          = cv2.cvtColor(smoothed, cv2.COLOR_RGB2GRAY)
 
-    # ---- Step 3: Build shading layer (soft tonal shading) ----
-    # Invert and blur heavily for smooth shading gradients
-    gray_inv       = cv2.bitwise_not(gray)
-    blur_light     = cv2.GaussianBlur(gray_inv, (21, 21), 0)
-    blur_heavy     = cv2.GaussianBlur(gray_inv, (61, 61), 0)
+    # ---- Step 3: Dodge blend for shading layer ----
+    gray_inv      = cv2.bitwise_not(gray)
+    blur          = cv2.GaussianBlur(gray_inv, (25, 25), 0)
+    shading       = cv2.divide(gray, cv2.bitwise_not(blur), scale=256.0)
 
-    # Dodge blend with light blur = fine detail shading
-    shade_fine     = cv2.divide(gray, cv2.bitwise_not(blur_light), scale=256.0)
+    # ---- Step 4: Edges from ORIGINAL image — keeps all detail ----
+    gray_orig     = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
+    edges         = cv2.Canny(gray_orig, 30, 90)
+    kernel        = np.ones((2, 2), np.uint8)
+    edges         = cv2.dilate(edges, kernel, iterations=1)
+    edges_inv     = cv2.bitwise_not(edges)
 
-    # Dodge blend with heavy blur = broad tonal shading
-    shade_broad    = cv2.divide(gray, cv2.bitwise_not(blur_heavy), scale=256.0)
-
-    # Blend both shading layers together
-    shading        = cv2.addWeighted(shade_fine, 0.5, shade_broad, 0.5, 0)
-
-    # ---- Step 4: Build clean edge lines (no dots/noise) ----
-    # Use Canny on the smoothed image — clean lines only
-    edges          = cv2.Canny(gray, 20, 80)
-
-    # Dilate edges slightly so lines are bold and visible
-    kernel         = np.ones((2, 2), np.uint8)
-    edges          = cv2.dilate(edges, kernel, iterations=1)
-
-    # Blur edges slightly to make them look hand-drawn not digital
-    edges          = cv2.GaussianBlur(edges, (3, 3), 0)
-
-    # Convert edges to white-background format (dark lines on white)
-    edges_inv      = cv2.bitwise_not(edges)
-
-    # ---- Step 5: Combine shading + edges ----
-    # Multiply blends: dark shading stays dark, white areas stay light
-    sketch         = cv2.multiply(
+    # ---- Step 5: Multiply shading + edges ----
+    sketch        = cv2.multiply(
         shading.astype(np.float32),
         edges_inv.astype(np.float32),
         scale=1/255.0
     ).astype(np.uint8)
 
-    # ---- Step 6: Saliency mask — isolate subject, clean background ----
-    pred           = normPRED(d[:, 0, :, :])
-    mask_np        = pred.squeeze().cpu().data.numpy()
-    mask           = cv2.resize((mask_np * 255).astype(np.uint8), (512, 512))
+    # ---- Step 6: Saliency mask — clean white background ----
+    pred          = normPRED(d[:, 0, :, :])
+    mask_np       = pred.squeeze().cpu().data.numpy()
+    mask          = cv2.resize((mask_np * 255).astype(np.uint8), (512, 512))
+    mask          = cv2.GaussianBlur(mask, (21, 21), 0)
+    _, mask_clean = cv2.threshold(mask, 50, 255, cv2.THRESH_BINARY)
+    mask_clean    = cv2.GaussianBlur(mask_clean, (31, 31), 0)
+    mask_norm     = mask_clean / 255.0
+    white_bg      = np.ones_like(sketch) * 255
+    result        = (sketch * mask_norm + white_bg * (1 - mask_norm)).astype(np.uint8)
 
-    # Smooth mask edges for natural subject cutout
-    mask           = cv2.GaussianBlur(mask, (21, 21), 0)
-    _, mask_clean  = cv2.threshold(mask, 50, 255, cv2.THRESH_BINARY)
-    mask_clean     = cv2.GaussianBlur(mask_clean, (41, 41), 0)
-    mask_norm      = mask_clean / 255.0
-
-    # Apply pure white background outside subject
-    white_bg       = np.ones_like(sketch) * 255
-    result         = (sketch * mask_norm + white_bg * (1 - mask_norm)).astype(np.uint8)
-
-    # ---- Step 7: Final enhancement ----
-    result_pil     = Image.fromarray(result)
-
-    # Boost contrast to make shading pop
-    result_pil     = ImageEnhance.Contrast(result_pil).enhance(1.8)
-
-    # Sharpen to make lines crisp
-    result_pil     = ImageEnhance.Sharpness(result_pil).enhance(2.5)
-
-    # One smooth pass to remove any remaining grain
-    result_pil     = result_pil.filter(ImageFilter.SMOOTH)
+    # ---- Step 7: Final polish ----
+    result_pil    = Image.fromarray(result)
+    result_pil    = ImageEnhance.Contrast(result_pil).enhance(1.6)
+    result_pil    = ImageEnhance.Sharpness(result_pil).enhance(2.0)
 
     return result_pil
 
