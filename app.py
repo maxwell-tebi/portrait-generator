@@ -15,78 +15,45 @@ st.set_page_config(
     layout="centered"
 )
 
-# ---- Google Drive model config ----
-MODEL_FILE     = "u2net_portrait.pth"
-GDRIVE_FILE_ID = "1fgZrjMgZBZP-9TqUPGmnR_FpHcANZ3DB"
+# ---- Hugging Face model config ----
+MODEL_FILE = "u2net_portrait.pth"
+HF_URL     = "https://huggingface.co/Maxwelltebi/u2net-portrait/resolve/main/u2net_portrait.pth"
 
-# ---- Robust Google Drive downloader ----
-def download_from_gdrive(file_id, destination):
-    session  = requests.Session()
-
-    # Step 1 — initial request
-    response = session.get(
-        "https://drive.google.com/uc",
-        params={"export": "download", "id": file_id},
-        stream=True
-    )
-
-    # Step 2 — find confirmation token (for large files)
-    token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            token = value
-            break
-
-    # Also check response content for newer Google Drive confirmation
-    if token is None:
-        for chunk in response.iter_content(chunk_size=32768):
-            # Look for confirmation token in HTML response
-            chunk_str = chunk.decode("utf-8", errors="ignore")
-            if "confirm=" in chunk_str:
-                import re
-                match = re.search(r'confirm=([0-9A-Za-z_\-]+)', chunk_str)
-                if match:
-                    token = match.group(1)
-                    break
-
-    # Step 3 — download with confirmation token
-    response = session.get(
-        "https://drive.google.com/uc",
-        params={"export": "download", "id": file_id, "confirm": token if token else "t"},
-        stream=True
-    )
-
-    # Step 4 — write to disk in chunks
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(chunk_size=32768):
-            if chunk:
-                f.write(chunk)
-
-    return os.path.getsize(destination)
-
-# ---- Download model if not present ----
+# ---- Download model from Hugging Face ----
 def download_model():
     if not os.path.exists(MODEL_FILE):
         with st.spinner("Downloading model weights... (first time only, ~170MB)"):
             try:
-                size = download_from_gdrive(GDRIVE_FILE_ID, MODEL_FILE)
+                response = requests.get(HF_URL, stream=True)
+                response.raise_for_status()
 
-                # Verify — a valid .pth file must be > 100MB
+                total    = int(response.headers.get('content-length', 0))
+                progress = st.progress(0)
+                received = 0
+
+                with open(MODEL_FILE, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=32768):
+                        if chunk:
+                            f.write(chunk)
+                            received += len(chunk)
+                            if total:
+                                progress.progress(min(received / total, 1.0))
+
+                progress.empty()
+
+                # Verify file size
+                size = os.path.getsize(MODEL_FILE)
                 if size < 100 * 1024 * 1024:
                     os.remove(MODEL_FILE)
-                    st.error(
-                        f"Download failed — got {size/1024:.1f} KB instead of ~170MB. "
-                        "Google Drive may have served a warning page. "
-                        "Please check that the file sharing is set to 'Anyone with the link'."
-                    )
+                    st.error(f"Download incomplete — only got {size/1024/1024:.1f}MB. Please refresh.")
                     st.stop()
 
-                st.success(f"Model downloaded! ({size / 1024 / 1024:.1f} MB)")
+                st.success(f"Model ready! ({size/1024/1024:.1f} MB)")
 
             except Exception as e:
                 if os.path.exists(MODEL_FILE):
                     os.remove(MODEL_FILE)
-                st.error(f"Download error: {e}")
+                st.error(f"Download failed: {e}")
                 st.stop()
 
 # ---- Load model ----
@@ -104,7 +71,7 @@ def normPRED(d):
     mi = torch.min(d)
     return (d - mi) / (ma - mi)
 
-# ---- Helper: preprocess image for model ----
+# ---- Helper: preprocess image ----
 def preprocess(image):
     img = np.array(image.convert('RGB'))
     img = skimage_transform.resize(img, (512, 512), mode='constant')
@@ -114,8 +81,7 @@ def preprocess(image):
     tmp[:, :, 1] = (img[:, :, 1] - 0.456) / 0.224
     tmp[:, :, 2] = (img[:, :, 2] - 0.406) / 0.225
     tmp = tmp.transpose((2, 0, 1))
-    tensor = torch.from_numpy(tmp).unsqueeze(0).float()
-    return tensor
+    return torch.from_numpy(tmp).unsqueeze(0).float()
 
 # ---- Style A: AI Draw ----
 def ai_draw(orig_np, d):
