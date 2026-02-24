@@ -1,11 +1,10 @@
+import os
+import requests
 import streamlit as st
 import torch
 import numpy as np
 import cv2
 from PIL import Image, ImageEnhance, ImageFilter
-from torchvision import transforms
-from torch.autograd import Variable
-import torch.nn.functional as F
 from skimage import transform as skimage_transform
 from u2net_model import U2NET
 
@@ -16,11 +15,64 @@ st.set_page_config(
     layout="centered"
 )
 
-# ---- Load model (cached so it only loads once) ----
+# ---- Google Drive model config ----
+MODEL_FILE     = "u2net_portrait.pth"
+GDRIVE_FILE_ID = "1fgZrjMgZBZP-9TqUPGmnR_FpHcANZ3DB"
+
+# ---- Robust Google Drive downloader ----
+def download_from_gdrive(file_id, destination):
+    """
+    Handles Google Drive's virus scan warning for large files
+    by manually following the confirmation token.
+    """
+    session = requests.Session()
+    URL = "https://drive.google.com/uc?export=download"
+
+    # First request — get confirmation token
+    response = session.get(URL, params={"id": file_id}, stream=True)
+    token = None
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            token = value
+            break
+
+    # Second request — use token to confirm large file download
+    if token:
+        response = session.get(
+            URL,
+            params={"id": file_id, "confirm": token},
+            stream=True
+        )
+
+    # Write file in chunks
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+
+# ---- Download model if not present ----
+def download_model():
+    if not os.path.exists(MODEL_FILE):
+        with st.spinner("Downloading model weights... (first time only, ~170MB)"):
+            try:
+                download_from_gdrive(GDRIVE_FILE_ID, MODEL_FILE)
+                # Verify file was actually downloaded and has content
+                if os.path.getsize(MODEL_FILE) < 1000:
+                    os.remove(MODEL_FILE)
+                    st.error("Download failed — file too small. Check Google Drive sharing settings.")
+                    st.stop()
+                st.success("Model downloaded successfully!")
+            except Exception as e:
+                st.error(f"Download failed: {e}")
+                st.stop()
+
+# ---- Load model ----
 @st.cache_resource
 def load_model():
+    download_model()
     net = U2NET(3, 1)
-    net.load_state_dict(torch.load('u2net_portrait.pth', map_location='cpu'))
+    net.load_state_dict(torch.load(MODEL_FILE, map_location='cpu'))
     net.eval()
     return net
 
@@ -45,71 +97,54 @@ def preprocess(image):
 
 # ---- Style A: AI Draw ----
 def ai_draw(orig_np, d):
-    pred  = 1.0 - normPRED(d[:, 0, :, :])
-    pred  = normPRED(pred)
-    mask  = pred.squeeze().cpu().data.numpy()
+    pred     = 1.0 - normPRED(d[:, 0, :, :])
+    pred     = normPRED(pred)
+    mask     = pred.squeeze().cpu().data.numpy()
     portrait = Image.fromarray((mask * 255)).convert('RGB')
     return portrait
 
 # ---- Style B: Pencil Sketch ----
 def pencil_sketch(orig_np, d):
-    # Grayscale
-    gray     = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
-
-    # Sharpen before sketching
-    kernel   = np.array([[0, -1, 0], [-1, 9, -1], [0, -1, 0]])
-    gray     = cv2.filter2D(gray, -1, kernel)
-
-    # Dodge blend
+    gray      = cv2.cvtColor(orig_np, cv2.COLOR_RGB2GRAY)
+    kernel    = np.array([[0, -1, 0], [-1, 9, -1], [0, -1, 0]])
+    gray      = cv2.filter2D(gray, -1, kernel)
     gray_inv  = cv2.bitwise_not(gray)
     gray_blur = cv2.GaussianBlur(gray_inv, (35, 35), 0)
     sketch    = cv2.divide(gray, cv2.bitwise_not(gray_blur), scale=256.0)
-
-    # Darken lines
-    sketch = np.clip(cv2.multiply(sketch, 0.75), 0, 255).astype(np.uint8)
-
-    # Adaptive threshold for crisp edges
-    edges  = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
+    sketch    = np.clip(cv2.multiply(sketch, 0.75), 0, 255).astype(np.uint8)
+    edges     = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
         cv2.THRESH_BINARY, blockSize=9, C=4
     )
-    sketch = cv2.multiply(sketch, edges, scale=1/255.0).astype(np.uint8)
-
-    # Saliency mask — clean white background
-    pred       = normPRED(d[:, 0, :, :])
-    mask_np    = pred.squeeze().cpu().data.numpy()
-    mask       = cv2.resize((mask_np * 255).astype(np.uint8), (512, 512))
-    mask       = cv2.GaussianBlur(mask, (21, 21), 0)
+    sketch        = cv2.multiply(sketch, edges, scale=1/255.0).astype(np.uint8)
+    pred          = normPRED(d[:, 0, :, :])
+    mask_np       = pred.squeeze().cpu().data.numpy()
+    mask          = cv2.resize((mask_np * 255).astype(np.uint8), (512, 512))
+    mask          = cv2.GaussianBlur(mask, (21, 21), 0)
     _, mask_clean = cv2.threshold(mask, 60, 255, cv2.THRESH_BINARY)
-    mask_clean = cv2.GaussianBlur(mask_clean, (31, 31), 0)
-
-    # Apply white background
-    mask_norm  = mask_clean / 255.0
-    white_bg   = np.ones_like(sketch) * 255
-    result     = (sketch * mask_norm + white_bg * (1 - mask_norm)).astype(np.uint8)
-
-    # Final boost
-    result_pil = Image.fromarray(result)
-    result_pil = ImageEnhance.Contrast(result_pil).enhance(2.5)
-    result_pil = ImageEnhance.Sharpness(result_pil).enhance(3.0)
-    result_pil = result_pil.filter(ImageFilter.SHARPEN)
-
+    mask_clean    = cv2.GaussianBlur(mask_clean, (31, 31), 0)
+    mask_norm     = mask_clean / 255.0
+    white_bg      = np.ones_like(sketch) * 255
+    result        = (sketch * mask_norm + white_bg * (1 - mask_norm)).astype(np.uint8)
+    result_pil    = Image.fromarray(result)
+    result_pil    = ImageEnhance.Contrast(result_pil).enhance(2.5)
+    result_pil    = ImageEnhance.Sharpness(result_pil).enhance(3.0)
+    result_pil    = result_pil.filter(ImageFilter.SHARPEN)
     return result_pil
+
 
 # ========== UI ==========
 
 st.title("🎨 AI Portrait Generator")
 st.markdown("Upload a photo and choose your portrait style.")
+st.markdown("---")
 
-# ---- Style selector ----
 style = st.radio(
     "Choose a style:",
     ["✏️ Pencil Sketch", "🖼️ AI Draw"],
     horizontal=True
 )
 
-# ---- Upload ----
 uploaded_file = st.file_uploader(
     "Upload your photo",
     type=["jpg", "jpeg", "png"]
@@ -117,43 +152,36 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
 
-    image = Image.open(uploaded_file).convert('RGB')
+    image         = Image.open(uploaded_file).convert('RGB')
     image_resized = image.resize((512, 512), Image.LANCZOS)
-    orig_np = np.array(image_resized)
+    orig_np       = np.array(image_resized)
 
     st.image(image, caption="Your uploaded photo", use_column_width=True)
+    st.markdown("---")
 
     if st.button("🎨 Generate Portrait"):
 
         with st.spinner("Generating your portrait... please wait"):
-
-            # Load model
-            net = load_model()
-
-            # Preprocess
+            net    = load_model()
             tensor = preprocess(image)
-
-            # Inference
             with torch.no_grad():
                 d = net(tensor)
-
-            # Apply selected style
             if style == "✏️ Pencil Sketch":
                 result = pencil_sketch(orig_np, d)
             else:
                 result = ai_draw(orig_np, d)
 
-        # Display result
-        st.success("Done!")
+        st.success("✅ Portrait generated!")
+        st.markdown("---")
+
         col1, col2 = st.columns(2)
         with col1:
             st.image(image, caption="Original", use_column_width=True)
         with col2:
             st.image(result, caption=style, use_column_width=True)
 
-        # Download button
-        result_pil = result if isinstance(result, Image.Image) else Image.fromarray(result)
         from io import BytesIO
+        result_pil = result if isinstance(result, Image.Image) else Image.fromarray(result)
         buf = BytesIO()
         result_pil.save(buf, format="PNG")
         st.download_button(
